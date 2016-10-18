@@ -125,23 +125,38 @@ mg_static_assert(sizeof(void *) >= sizeof(int), "data type size check");
 #include <fcntl.h>
 #endif /* !_WIN32_WCE */
 
-#ifdef __MACH__
+
+#ifdef __clang__
+/* When using -Weverything, clang does not accept it's own headers
+ * in a release build configuration. Disable what is too much in
+ * -Weverything. */
+#pragma clang diagnostic ignored "-Wdisabled-macro-expansion"
+#endif
+
+
+#ifdef __MACH__ /* Apple OSX section */
+
+#ifdef __clang__
+/* Avoid warnings for Xopen 7.00 and higher */
+#pragma clang diagnostic ignored "-Wno-reserved-id-macro"
+#pragma clang diagnostic ignored "-Wno-keyword-macro"
+#endif
 
 #define CLOCK_MONOTONIC (1)
 #define CLOCK_REALTIME (2)
 
+#include <sys/errno.h>
 #include <sys/time.h>
 #include <mach/clock.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <assert.h>
 
-
-/* clock_gettime is not implemented on OSX */
-int clock_gettime(int clk_id, struct timespec *t);
+/* clock_gettime is not implemented on OSX prior to 10.12 */
+int _civet_clock_gettime(int clk_id, struct timespec *t);
 
 int
-clock_gettime(int clk_id, struct timespec *t)
+_civet_clock_gettime(int clk_id, struct timespec *t)
 {
 	memset(t, 0, sizeof(*t));
 	if (clk_id == CLOCK_REALTIME) {
@@ -181,6 +196,27 @@ clock_gettime(int clk_id, struct timespec *t)
 	}
 	return -1; /* EINVAL - Clock ID is unknown */
 }
+
+/* if clock_gettime is declared, then __CLOCK_AVAILABILITY will be defined */
+#ifdef __CLOCK_AVAILABILITY
+/* If we compiled with Mac OSX 10.12 or later, then clock_gettime will be
+ * declared
+ * but it may be NULL at runtime. So we need to check before using it. */
+int _civet_safe_clock_gettime(int clk_id, struct timespec *t);
+
+int
+_civet_safe_clock_gettime(int clk_id, struct timespec *t)
+{
+	if (clock_gettime) {
+		return clock_gettime(clk_id, t);
+	}
+	return _civet_clock_gettime(clk_id, t);
+}
+#define clock_gettime _civet_safe_clock_gettime
+#else
+#define clock_gettime _civet_clock_gettime
+#endif
+
 #endif
 
 
@@ -1015,6 +1051,7 @@ typedef struct SSL_CTX SSL_CTX;
 #include <openssl/pem.h>
 #include <openssl/engine.h>
 #include <openssl/conf.h>
+#include <openssl/dh.h>
 #else
 /* SSL loaded dynamically from DLL.
  * I put the prototypes here to be independent from OpenSSL source
@@ -1045,6 +1082,8 @@ typedef struct x509 X509;
 #define SSL_OP_NO_TLSv1_2 (0x08000000L)
 #define SSL_OP_NO_TLSv1_1 (0x10000000L)
 #define SSL_OP_SINGLE_DH_USE (0x00100000L)
+#define SSL_OP_CIPHER_SERVER_PREFERENCE (0x00400000L)
+#define SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION (0x00010000L)
 
 #define SSL_ERROR_NONE (0)
 #define SSL_ERROR_SSL (1)
@@ -1341,6 +1380,9 @@ enum {
 #if defined(__linux__)
 	ALLOW_SENDFILE_CALL,
 #endif
+#if defined(_WIN32)
+	CASE_SENSITIVE_FILES,
+#endif
 
 	NUM_OPTIONS
 };
@@ -1417,6 +1459,9 @@ static struct mg_option config_options[] = {
 #endif
 #if defined(__linux__)
     {"allow_sendfile_call", CONFIG_TYPE_BOOLEAN, "yes"},
+#endif
+#if defined(_WIN32)
+    {"case_sensitive", CONFIG_TYPE_BOOLEAN, "no"},
 #endif
 
     {NULL, CONFIG_TYPE_UNKNOWN, NULL}};
@@ -2373,7 +2418,9 @@ skip_quoted(char **buf,
 	if (*end_word == '\0') {
 		*buf = end_word;
 	} else {
-		end_whitespace = end_word + 1 + strspn(end_word + 1, whitespace);
+		end_whitespace =
+		    end_word + ((unsigned int)strspn(&end_word[1], whitespace)
+		                + (unsigned int)1);
 
 		for (p = end_word; p < end_whitespace; p++) {
 			*p = '\0';
@@ -3280,15 +3327,22 @@ path_to_unicode(const struct mg_connection *conn,
 		wbuf[0] = L'\0';
 	}
 
-	/* TODO: Add a configuration to switch between case sensitive and
-	 * case insensitive URIs for Windows server. */
-	/*
+	/* Windows file systems are not case sensitive, but you can still use
+	 * uppercase and lowercase letters (on all modern file systems).
+	 * The server can check if the URI uses the same upper/lowercase
+	 * letters an the file system, effectively making Windows servers
+	 * case sensitive (like Linux servers are). It is still not possible
+	 * to use two files with the same name in different cases on Windows
+	 * (like /a and /A) - this would be possible in Linux.
+	 * As a default, Windows is not case sensitive, but the case sensitive
+	 * file name check can be activated by an additional configuration. */
 	if (conn) {
-	    if (conn->ctx->config[WINDOWS_CASE_SENSITIVE]) {
-	        fcompare = wcscmp;
-	    }
+		if (conn->ctx->config[CASE_SENSITIVE_FILES]
+		    && !mg_strcasecmp(conn->ctx->config[CASE_SENSITIVE_FILES], "yes")) {
+			/* Use case sensitive compare function */
+			fcompare = wcscmp;
+		}
 	}
-	*/
 	(void)conn; /* conn is currently unused */
 
 #if !defined(_WIN32_WCE)
@@ -6886,7 +6940,8 @@ static void
 handle_static_file_request(struct mg_connection *conn,
                            const char *path,
                            struct file *filep,
-                           const char *mime_type)
+                           const char *mime_type,
+                           const char *additional_headers)
 {
 	char date[64], lm[64], etag[64];
 	char range[128]; /* large enough, so there will be no overflow */
@@ -7015,7 +7070,7 @@ handle_static_file_request(struct mg_connection *conn,
 	                "Content-Length: %" INT64_FMT "\r\n"
 	                "Connection: %s\r\n"
 	                "Accept-Ranges: bytes\r\n"
-	                "%s%s\r\n",
+	                "%s%s",
 	                lm,
 	                etag,
 	                (int)mime_vec.len,
@@ -7024,6 +7079,18 @@ handle_static_file_request(struct mg_connection *conn,
 	                suggest_connection_header(conn),
 	                range,
 	                encoding);
+
+	/* The previous code must not add any header starting with X- to make
+	 * sure no one of the additional_headers is included twice */
+
+	if (additional_headers != NULL) {
+		(void)mg_printf(conn,
+		                "%.*s\r\n\r\n",
+		                (int)strlen(additional_headers),
+		                additional_headers);
+	} else {
+		(void)mg_printf(conn, "\r\n");
+	}
 
 	if (strcmp(conn->request_info.request_method, "HEAD") != 0) {
 		send_file_data(conn, filep, r1, cl);
@@ -7079,6 +7146,16 @@ mg_send_mime_file(struct mg_connection *conn,
                   const char *path,
                   const char *mime_type)
 {
+	mg_send_mime_file2(conn, path, mime_type, NULL);
+}
+
+
+void
+mg_send_mime_file2(struct mg_connection *conn,
+                   const char *path,
+                   const char *mime_type,
+                   const char *additional_headers)
+{
 	struct file file = STRUCT_FILE_INITIALIZER;
 	if (mg_stat(conn, path, &file)) {
 		if (file.is_directory) {
@@ -7095,7 +7172,8 @@ mg_send_mime_file(struct mg_connection *conn,
 				                "Error: Directory listing denied");
 			}
 		} else {
-			handle_static_file_request(conn, path, &file, mime_type);
+			handle_static_file_request(
+			    conn, path, &file, mime_type, additional_headers);
 		}
 	} else {
 		send_http_error(conn, 404, "%s", "Error: File not found");
@@ -9152,8 +9230,8 @@ read_websocket(struct mg_connection *conn,
 	 * the
 	 * websocket_data callback.  This is either mem on the stack, or a
 	 * dynamically allocated buffer if it is too large. */
-	char mem[4096];
-	char *data = mem;
+	unsigned char mem[4096];
+	unsigned char *data = mem;
 	unsigned char mop; /* mask flag and opcode */
 	double timeout = -1.0;
 
@@ -9191,7 +9269,7 @@ read_websocket(struct mg_connection *conn,
 			/* Allocate space to hold websocket payload */
 			data = mem;
 			if (data_len > sizeof(mem)) {
-				data = (char *)mg_malloc(data_len);
+				data = (unsigned char *)mg_malloc(data_len);
 				if (data == NULL) {
 					/* Allocation failed, exit the loop and then close the
 					 * connection */
@@ -9217,8 +9295,11 @@ read_websocket(struct mg_connection *conn,
 				memcpy(data, buf + header_len, len);
 				error = 0;
 				while (len < data_len) {
-					n = pull(
-					    NULL, conn, data + len, (int)(data_len - len), timeout);
+					n = pull(NULL,
+					         conn,
+					         (char *)(data + len),
+					         (int)(data_len - len),
+					         timeout);
 					if (n <= 0) {
 						error = 1;
 						break;
@@ -9259,7 +9340,8 @@ read_websocket(struct mg_connection *conn,
 			 * or "connection close" opcode received (client side). */
 			exit_by_callback = 0;
 			if ((ws_data_handler != NULL)
-			    && !ws_data_handler(conn, mop, data, data_len, callback_data)) {
+			    && !ws_data_handler(
+			           conn, mop, (char *)data, data_len, callback_data)) {
 				exit_by_callback = 1;
 			}
 
@@ -9305,7 +9387,8 @@ mg_websocket_write_exec(struct mg_connection *conn,
 
 	int retval = -1;
 
-	header[0] = 0x80 + (opcode & 0xF);
+	header[0] =
+	    (unsigned char)0x80u + ((unsigned char)opcode & (unsigned char)0xFu);
 
 	/* Frame format: http://tools.ietf.org/html/rfc6455#section-5.2 */
 	if (dataLen < 126) {
@@ -9320,8 +9403,8 @@ mg_websocket_write_exec(struct mg_connection *conn,
 		headerLen = 4;
 	} else {
 		/* 64-bit length field */
-		uint32_t len1 = htonl((uint64_t)dataLen >> 32);
-		uint32_t len2 = htonl(dataLen & 0xFFFFFFFF);
+		uint32_t len1 = htonl((uint32_t)((uint64_t)dataLen >> 32));
+		uint32_t len2 = htonl((uint32_t)(dataLen & 0xFFFFFFFFu));
 		header[1] = 127;
 		memcpy(header + 2, &len1, 4);
 		memcpy(header + 6, &len2, 4);
@@ -9633,9 +9716,9 @@ set_throttle(const char *spec, uint32_t remote_ip, const char *uri)
 
 	while ((spec = next_option(spec, &vec, &val)) != NULL) {
 		mult = ',';
-		if (sscanf(val.ptr, "%lf%c", &v, &mult) < 1 || v < 0
-		    || (lowercase(&mult) != 'k' && lowercase(&mult) != 'm'
-		        && mult != ',')) {
+		if ((val.ptr == NULL) || (sscanf(val.ptr, "%lf%c", &v, &mult) < 1)
+		    || (v < 0) || ((lowercase(&mult) != 'k')
+		                   && (lowercase(&mult) != 'm') && (mult != ','))) {
 			continue;
 		}
 		v *= (lowercase(&mult) == 'k')
@@ -10270,6 +10353,7 @@ handle_request(struct mg_connection *conn)
 				/* callback already processed the request. Store the
 				   return value as a status code for the access log. */
 				conn->status_code = i;
+				discard_unread_request_data(conn);
 				return;
 			} else if (i == 0) {
 				/* civetweb should process the request */
@@ -10644,7 +10728,7 @@ handle_file_based_request(struct mg_connection *conn,
 		handle_not_modified_static_file_request(conn, file);
 #endif /* !NO_CACHING */
 	} else {
-		handle_static_file_request(conn, path, file, NULL);
+		handle_static_file_request(conn, path, file, NULL, NULL);
 	}
 }
 
@@ -10669,12 +10753,21 @@ close_all_listening_sockets(struct mg_context *ctx)
 
 
 /* Valid listening port specification is: [ip_address:]port[s]
- * Examples for IPv4: 80, 443s, 127.0.0.1:3128, 1.2.3.4:8080s
+ * Examples for IPv4: 80, 443s, 127.0.0.1:3128, 192.0.2.3:8080s
  * Examples for IPv6: [::]:80, [::1]:80,
- *   [FEDC:BA98:7654:3210:FEDC:BA98:7654:3210]:443s
- *   see https://tools.ietf.org/html/rfc3513#section-2.2 */
+ *   [2001:0db8:7654:3210:FEDC:BA98:7654:3210]:443s
+ *   see https://tools.ietf.org/html/rfc3513#section-2.2
+ * In order to bind to both, IPv4 and IPv6, you can either add
+ * both ports using 8080,[::]:8080, or the short form +8080.
+ * Both forms differ in detail: 8080,[::]:8080 create two sockets,
+ * one only accepting IPv4 the other only IPv6. +8080 creates
+ * one socket accepting IPv4 and IPv6. Depending on the IPv6
+ * environment, they might work differently, or might not work
+ * at all - it must be tested what options work best in the
+ * relevant network environment.
+ */
 static int
-parse_port_string(const struct vec *vec, struct socket *so)
+parse_port_string(const struct vec *vec, struct socket *so, int *ip_version)
 {
 	unsigned int a, b, c, d, port;
 	int ch, len;
@@ -10687,6 +10780,7 @@ parse_port_string(const struct vec *vec, struct socket *so)
 	 * for both IPv4 and IPv6 (INADDR_ANY and IN6ADDR_ANY_INIT). */
 	memset(so, 0, sizeof(*so));
 	so->lsa.sin.sin_family = AF_INET;
+	*ip_version = 0;
 
 	if (sscanf(vec->ptr, "%u.%u.%u.%u:%u%n", &a, &b, &c, &d, &port, &len)
 	    == 5) {
@@ -10694,6 +10788,8 @@ parse_port_string(const struct vec *vec, struct socket *so)
 		so->lsa.sin.sin_addr.s_addr =
 		    htonl((a << 24) | (b << 16) | (c << 8) | d);
 		so->lsa.sin.sin_port = htons((uint16_t)port);
+		*ip_version = 4;
+
 #if defined(USE_IPV6)
 	} else if (sscanf(vec->ptr, "[%49[^]]]:%u%n", buf, &port, &len) == 2
 	           && mg_inet_pton(
@@ -10702,10 +10798,32 @@ parse_port_string(const struct vec *vec, struct socket *so)
 		/* so->lsa.sin6.sin6_family = AF_INET6; already set by mg_inet_pton
 		 */
 		so->lsa.sin6.sin6_port = htons((uint16_t)port);
+		*ip_version = 6;
 #endif
+
+	} else if ((vec->ptr[0] == '+')
+	           && (sscanf(vec->ptr + 1, "%u%n", &port, &len) == 1)) {
+
+		/* Port is specified with a +, bind to IPv6 and IPv4, INADDR_ANY */
+		/* Add 1 to len for the + character we skipped before */
+		len++;
+
+#if defined(USE_IPV6)
+		/* Set socket family to IPv6, do not use IPV6_V6ONLY */
+		so->lsa.sin6.sin6_family = AF_INET6;
+		so->lsa.sin6.sin6_port = htons((uint16_t)port);
+		*ip_version = 4 + 6;
+#else
+		/* Bind to IPv4 only, since IPv6 is not built in. */
+		so->lsa.sin.sin_port = htons((uint16_t)port);
+		*ip_version = 4;
+#endif
+
 	} else if (sscanf(vec->ptr, "%u%n", &port, &len) == 1) {
 		/* If only port is specified, bind to IPv4, INADDR_ANY */
 		so->lsa.sin.sin_port = htons((uint16_t)port);
+		*ip_version = 4;
+
 	} else {
 		/* Parsing failure. Make port invalid. */
 		port = 0;
@@ -10715,6 +10833,7 @@ parse_port_string(const struct vec *vec, struct socket *so)
 	/* sscanf and the option splitting code ensure the following condition
 	 */
 	if ((len < 0) && ((unsigned)len > (unsigned)vec->len)) {
+		*ip_version = 0;
 		return 0;
 	}
 	ch = vec->ptr[len]; /* Next character after the port number */
@@ -10722,8 +10841,14 @@ parse_port_string(const struct vec *vec, struct socket *so)
 	so->ssl_redir = (ch == 'r');
 
 	/* Make sure the port is valid and vector ends with 's', 'r' or ',' */
-	return is_valid_port(port)
-	       && (ch == '\0' || ch == 's' || ch == 'r' || ch == ',');
+	if (is_valid_port(port)
+	    && (ch == '\0' || ch == 's' || ch == 'r' || ch == ',')) {
+		return 1;
+	}
+
+	/* Reset ip_version to 0 of there is an error */
+	*ip_version = 0;
+	return 0;
 }
 
 
@@ -10741,6 +10866,7 @@ set_ports_option(struct mg_context *ctx)
 	struct pollfd *pfd;
 	union usa usa;
 	socklen_t len;
+	int ip_version;
 
 	int portsTotal = 0;
 	int portsOk = 0;
@@ -10753,11 +10879,12 @@ set_ports_option(struct mg_context *ctx)
 	memset(&usa, 0, sizeof(usa));
 	len = sizeof(usa);
 	list = ctx->config[LISTENING_PORTS];
+
 	while ((list = next_option(list, &vec, NULL)) != NULL) {
 
 		portsTotal++;
 
-		if (!parse_port_string(&vec, &so)) {
+		if (!parse_port_string(&vec, &so, &ip_version)) {
 			mg_cry(fc(ctx),
 			       "%.*s: invalid port spec (entry %i). Expecting list of: %s",
 			       (int)vec.len,
@@ -10801,6 +10928,7 @@ set_ports_option(struct mg_context *ctx)
 		               (SOCK_OPT_TYPE)&on,
 		               sizeof(on)) != 0) {
 
+			/* Set reuse option, but don't abort on errors. */
 			mg_cry(fc(ctx),
 			       "cannot set socket option SO_EXCLUSIVEADDRUSE (entry %i)",
 			       portsTotal);
@@ -10812,25 +10940,36 @@ set_ports_option(struct mg_context *ctx)
 		               (SOCK_OPT_TYPE)&on,
 		               sizeof(on)) != 0) {
 
+			/* Set reuse option, but don't abort on errors. */
 			mg_cry(fc(ctx),
 			       "cannot set socket option SO_REUSEADDR (entry %i)",
 			       portsTotal);
 		}
 #endif
 
+		if (ip_version > 4) {
 #if defined(USE_IPV6)
-		if (so.lsa.sa.sa_family == AF_INET6
-		    && setsockopt(so.sock,
-		                  IPPROTO_IPV6,
-		                  IPV6_V6ONLY,
-		                  (void *)&off,
-		                  sizeof(off)) != 0) {
+			if (ip_version == 6) {
+				if (so.lsa.sa.sa_family == AF_INET6
+				    && setsockopt(so.sock,
+				                  IPPROTO_IPV6,
+				                  IPV6_V6ONLY,
+				                  (void *)&off,
+				                  sizeof(off)) != 0) {
 
-			mg_cry(fc(ctx),
-			       "cannot set socket option IPV6_V6ONLY (entry %i)",
-			       portsTotal);
-		}
+					/* Set IPv6 only option, but don't abort on errors. */
+					mg_cry(fc(ctx),
+					       "cannot set socket option IPV6_V6ONLY (entry %i)",
+					       portsTotal);
+				}
+			}
+#else
+			mg_cry(fc(ctx), "IPv6 not available");
+			closesocket(so.sock);
+			so.sock = INVALID_SOCKET;
+			continue;
 #endif
+		}
 
 		if (so.lsa.sa.sa_family == AF_INET) {
 
@@ -11300,7 +11439,7 @@ sslize(struct mg_connection *conn, SSL_CTX *s, int (*func)(SSL *))
 	/* SSL functions may fail and require to be called again:
 	 * see https://www.openssl.org/docs/manmaster/ssl/SSL_get_error.html
 	 * Here "func" could be SSL_connect or SSL_accept. */
-	for (i = 0; i <= 16; i *= 2) {
+	for (i = 1; i <= 16; i *= 2) {
 		ret = func(conn->ssl);
 		if (ret != 1) {
 			err = SSL_get_error(conn->ssl, ret);
@@ -11664,6 +11803,7 @@ set_ssl_option(struct mg_context *ctx)
 	protocol_ver = atoi(ctx->config[SSL_PROTOCOL_VERSION]);
 	SSL_CTX_set_options(ctx->ssl_ctx, ssl_get_protocol(protocol_ver));
 	SSL_CTX_set_options(ctx->ssl_ctx, SSL_OP_SINGLE_DH_USE);
+	SSL_CTX_set_options(ctx->ssl_ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
 	SSL_CTX_set_ecdh_auto(ctx->ssl_ctx, 1);
 
 	/* If a callback has been specified, call it. */
@@ -11905,26 +12045,34 @@ close_socket_gracefully(struct mg_connection *conn)
 	int n;
 #endif
 	struct linger linger;
+	int error_code = 0;
+	socklen_t opt_len = sizeof(error_code);
 
 	if (!conn) {
 		return;
 	}
 
 	/* Set linger option to avoid socket hanging out after close. This
-	 * prevent
-	 * ephemeral port exhaust problem under high QPS. */
+	 * prevent ephemeral port exhaust problem under high QPS. */
 	linger.l_onoff = 1;
 	linger.l_linger = 1;
 
-	if (setsockopt(conn->client.sock,
-	               SOL_SOCKET,
-	               SO_LINGER,
-	               (char *)&linger,
-	               sizeof(linger)) != 0) {
-		mg_cry(conn,
-		       "%s: setsockopt(SOL_SOCKET SO_LINGER) failed: %s",
-		       __func__,
-		       strerror(ERRNO));
+	getsockopt(
+	    conn->client.sock, SOL_SOCKET, SO_ERROR, (char *)&error_code, &opt_len);
+
+	if (error_code == ECONNRESET) {
+		/* Socket already closed by client/peer, close socket without linger */
+	} else {
+		if (setsockopt(conn->client.sock,
+		               SOL_SOCKET,
+		               SO_LINGER,
+		               (char *)&linger,
+		               sizeof(linger)) != 0) {
+			mg_cry(conn,
+			       "%s: setsockopt(SOL_SOCKET SO_LINGER) failed: %s",
+			       __func__,
+			       strerror(ERRNO));
+		}
 	}
 
 	/* Send FIN to the client */

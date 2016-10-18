@@ -413,24 +413,36 @@ START_TEST(test_parse_port_string)
 	  "[::1]:123",
 	  "[::]:80",
 	  "[3ffe:2a00:100:7031::1]:900",
+	  "+80",
 #endif
 	  NULL };
 	static const char *invalid[] = {
 	    "99999", "1k", "1.2.3", "1.2.3.4:", "1.2.3.4:2p", NULL};
 	struct socket so;
 	struct vec vec;
+	int ip_family;
 	int i;
 
 	for (i = 0; valid[i] != NULL; i++) {
 		vec.ptr = valid[i];
 		vec.len = strlen(vec.ptr);
-		ck_assert(parse_port_string(&vec, &so) != 0);
+		ip_family = 123;
+		ck_assert_int_ne(parse_port_string(&vec, &so, &ip_family), 0);
+		if (i < 7) {
+			ck_assert_int_eq(ip_family, 4);
+		} else if (i < 10) {
+			ck_assert_int_eq(ip_family, 6);
+		} else {
+			ck_assert_int_eq(ip_family, 4 + 6);
+		}
 	}
 
 	for (i = 0; invalid[i] != NULL; i++) {
 		vec.ptr = invalid[i];
 		vec.len = strlen(vec.ptr);
-		ck_assert(parse_port_string(&vec, &so) == 0);
+		ip_family = 123;
+		ck_assert_int_eq(parse_port_string(&vec, &so, &ip_family), 0);
+		ck_assert_int_eq(ip_family, 0);
 	}
 }
 END_TEST
@@ -708,10 +720,17 @@ make_private_suite(void)
 void
 MAIN_PRIVATE(void)
 {
+#if defined(_WIN32)
+	/* test_parse_port_string requires WSAStartup for IPv6 */
+	WSADATA data;
+	WSAStartup(MAKEWORD(2, 2), &data);
+#endif
+
 	test_alloc_vprintf(0);
 	test_mg_vsnprintf(0);
 	test_remove_double_dots_and_double_slashes(0);
 	test_parse_date_string(0);
+	test_parse_port_string(0);
 	test_parse_http_message(0);
 }
 
