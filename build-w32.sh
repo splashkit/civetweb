@@ -8,3 +8,5 @@ gcc -shared -Wall -Wextra -Wshadow -Wformat-security -Winit-self -Wmissing-proto
   -static-libstdc++ -static-libgcc \
   -Wl,-Bstatic -lstdc++ -lpthread \
   -o libcivetweb.dll
+
+mv libcivetweb.dll ../../lib/win32

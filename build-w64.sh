@@ -8,3 +8,5 @@ gcc -m64 -shared -Wall -Wextra -Wshadow -Wformat-security -Winit-self -Wmissing-
   -static-libstdc++ -static-libgcc \
   -Wl,-Bstatic -lstdc++ -lpthread \
   -o libcivetweb.dll
+
+mv libcivetweb.dll ../../lib/win64
